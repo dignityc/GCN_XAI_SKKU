@@ -7,7 +7,11 @@ import numpy as np
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 
-import wandb, os
+import os
+try:
+    import wandb  # type: ignore
+except Exception:
+    wandb = None
 
 ###### PARSER custom args:
 
@@ -17,14 +21,18 @@ parser.add_argument('--sampling_size', type=int, default=260000, help='the train
 parser.add_argument('--batch_size', type=int, default=65536, help='the batch size')
 parser.add_argument('--alpha', type=float, default=0.0, help='the alpha')
 parser.add_argument('--lr', type=float, default=0.001, help='the learning rate')
+parser.add_argument('--epochs', type=int, default=5, help='number of training epochs')
+parser.add_argument('--no_wandb', action='store_true', help='disable Weights & Biases logging')
 args = parser.parse_args()
 
 sampling_size = args.sampling_size
 batch_size = args.batch_size
 
-os.environ['WANDB_WATCH'] = 'all'
-wandb.login(key = "d737480c1d812ca4c1c791b14b0888051f72b45a")
-wandb.init(name=f"{str(args.alpha)}-alpha,lr:{args.lr}",
+use_wandb = (not getattr(args, 'no_wandb', False)) and (wandb is not None)
+if use_wandb:
+    os.environ['WANDB_WATCH'] = 'all'
+    wandb.login(key = "d737480c1d812ca4c1c791b14b0888051f72b45a")
+    wandb.init(name=f"{str(args.alpha)}-alpha,lr:{args.lr}",
            project="GCN-recommendaiton",
            tags=['for_testing_in_A100'],
            group=f"FinalModel:{sampling_size}"
@@ -66,7 +74,7 @@ class LightGCN(nn.Module):
         all_emb = torch.cat([users_emb, items_emb])
         embs = [all_emb]
         for layer in range(self.n_layers):
-            all_emb = torch.sparse.mm(self.adj_matrix, all_emb)
+            all_emb = torch.mm(self.adj_matrix, all_emb)
             embs.append(all_emb)
         embs = torch.stack(embs, dim=1)
         light_out = torch.mean(embs, dim=1)
@@ -218,26 +226,26 @@ positive_items = positive_samples['itemID'].tolist()
 
 # 부정적 유저-아이템 데이터 생성
 all_items = set(new_ui['itemID'].unique())
+# Build user -> interacted items mapping
+user_to_items = new_ui.groupby('userID')['itemID'].apply(set).to_dict()
 negative_users = []
 negative_items = []
 
-while len(negative_users) < sampling_size:
-    i = 0
-    random_user = positive_users[i]
-    random_item = random.choice(list(all_items))
-
-    # 해당 유저가 해당 아이템과 상호작용하지 않았을 경우만 부정적 데이터로 추가
-    if not new_ui[(new_ui['userID'] == random_user) & (new_ui['itemID'] == random_item)].empty:
-        continue
-
-    negative_users.append(random_user)
-    negative_items.append(random_item)
-    i += 1
+# Generate one negative item per positive sample to match lengths
+for u, _pos_item in zip(positive_users, positive_items):
+    interacted = user_to_items.get(u, set())
+    candidates = list(all_items - interacted)
+    # Fallback in case a user interacted with all items (unlikely in small dummy data)
+    if not candidates:
+        candidates = list(all_items)
+    neg_item = random.choice(candidates)
+    negative_users.append(u)
+    negative_items.append(neg_item)
 
 print(len(positive_users), len(positive_items), len(negative_items))
 
 num_nodes = total_nodes_length
-epochs = 10000
+epochs = args.epochs
 dataset = InteractionDataset(positive_users, positive_items, negative_items)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 user_features = torch.FloatTensor(np.array(user_features.tolist()))
@@ -262,7 +270,7 @@ ground_truth = grouped.to_dict()
 def generate_recommendations(model, node_features, adj, user_ids, num_recommendations):
     model.eval()
     with torch.no_grad():
-        NGCF, Light = model(node_features, adj, batch_users, batch_pos_items)
+        NGCF, Light = model(node_features, adj, user_ids if isinstance(user_ids, torch.Tensor) else torch.tensor([], dtype=torch.long, device=device), torch.tensor([], dtype=torch.long, device=device))
     recommendations = {}
     # Correcting the range of item_ids
     item_ids = torch.arange(len(unique_users), len(unique_users) + len(unique_items)).to(device)
@@ -349,8 +357,10 @@ for epoch in range(epochs):
 
         Loss = total_loss / len(dataloader)
         print(f"Epoch {epoch + 1}, Loss: {Loss}, Recall10: {Recall10}, NDCG10: {Ndcg10}, Recall50: {Recall50}, NDCG50: {Ndcg50}, Recall100: {Recall100}, NDCG100: {Ndcg100}")
-        wandb.log({"Loss": Loss, "Recall10": Recall10, "NDCG10": Ndcg10, "Recall50": Recall50, "NDCG50": Ndcg50, "Recall100": Recall100, "NDCG100": Ndcg100})
+        if use_wandb:
+            wandb.log({"Loss": Loss, "Recall10": Recall10, "NDCG10": Ndcg10, "Recall50": Recall50, "NDCG50": Ndcg50, "Recall100": Recall100, "NDCG100": Ndcg100})
     else: 
         Loss = total_loss / len(dataloader)
         print(f"Epoch {epoch + 1}, Loss: {Loss}")
-        wandb.log({"Loss": Loss})
+        if use_wandb:
+            wandb.log({"Loss": Loss})
